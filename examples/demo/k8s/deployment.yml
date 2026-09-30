@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: example/api:local
+          env:
+            - name: API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: api-credentials
+                  key: API_PASSWORD

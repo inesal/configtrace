@@ -1,0 +1,7 @@
+ansible: ansible/vars.yml
+template: deploy/app.env.j2
+compose: deploy/compose.yml
+service: api
+kubernetes:
+  - k8s/external_secret.yml
+  - k8s/deployment.yml
