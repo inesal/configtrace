@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -69,6 +70,46 @@ class ConfigTraceTests(unittest.TestCase):
             (project / "configtrace.yml").write_text("secret: [SYNTHETIC_SECRET_VALUE\n", encoding="utf-8")
             with self.assertRaises(ValueError) as raised:
                 run_checks(project)
+            self.assertNotIn("SYNTHETIC_SECRET_VALUE", str(raised.exception))
+
+    def test_nested_ansible_list_compose_and_multiple_kubernetes_documents(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "demo"
+            shutil.copytree(DEMO, project)
+            (project / "ansible" / "vars.yml").write_text(
+                "vars:\n  api_password: \"{{ lookup('hashi_vault', 'secret=secret/data/demo:password') }}\"\n",
+                encoding="utf-8",
+            )
+            (project / "deploy" / "compose.yml").write_text(
+                "services:\n  api:\n    environment:\n      - API_PASSWORD\n",
+                encoding="utf-8",
+            )
+            (project / "k8s" / "external_secret.yml").write_text(
+                "kind: ExternalSecret\nmetadata:\n  name: api-credentials\nspec:\n  target:\n    name: api-credentials\n  data:\n    - secretKey: API_PASSWORD\n---\n"
+                "kind: ExternalSecret\nmetadata:\n  name: metrics-credentials\nspec:\n  target:\n    name: metrics-credentials\n  data:\n    - secretKey: METRICS_TOKEN\n",
+                encoding="utf-8",
+            )
+            (project / "k8s" / "deployment.yml").write_text(
+                "kind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n        - env:\n            - valueFrom:\n                secretKeyRef:\n                  name: api-credentials\n                  key: API_PASSWORD\n---\n"
+                "kind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n        - env:\n            - valueFrom:\n                secretKeyRef:\n                  name: metrics-credentials\n                  key: METRICS_TOKEN\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(run_checks(project), [])
+
+    def test_configuration_cannot_read_outside_project_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "demo"
+            project.mkdir()
+            outside = root / "outside.yml"
+            outside.write_text("SYNTHETIC_SECRET_VALUE: [broken\n", encoding="utf-8")
+            (project / "configtrace.yml").write_text(
+                "ansible: ../outside.yml\ntemplate: deploy/app.env.j2\ncompose: deploy/compose.yml\nservice: api\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as raised:
+                run_checks(project)
+            self.assertIn("inside the project folder", str(raised.exception))
             self.assertNotIn("SYNTHETIC_SECRET_VALUE", str(raised.exception))
 
 

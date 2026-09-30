@@ -39,16 +39,15 @@ def _load_yaml(path: Path) -> list[Any]:
         raise ValueError(f"could not read YAML file {path}: {exc.strerror or 'file access failed'}") from None
 
 
-def _walk_scalars(value: Any):
+def _walk_scalar_pairs(value: Any):
     if isinstance(value, dict):
         for key, child in value.items():
-            yield from _walk_scalars(key)
-            yield from _walk_scalars(child)
+            if isinstance(key, str) and isinstance(child, str):
+                yield key, child
+            yield from _walk_scalar_pairs(child)
     elif isinstance(value, list):
         for child in value:
-            yield from _walk_scalars(child)
-    elif isinstance(value, str):
-        yield value
+            yield from _walk_scalar_pairs(child)
 
 
 def _find_vault_references(path: Path) -> dict[str, VaultReference]:
@@ -56,15 +55,12 @@ def _find_vault_references(path: Path) -> dict[str, VaultReference]:
     for document in _load_yaml(path):
         if not isinstance(document, dict):
             continue
-        for variable, value in document.items():
-            if not isinstance(variable, str):
+        for variable, scalar in _walk_scalar_pairs(document):
+            if not LOOKUP_RE.search(scalar):
                 continue
-            for scalar in _walk_scalars(value):
-                if not LOOKUP_RE.search(scalar):
-                    continue
-                match = SECRET_RE.search(scalar)
-                if match:
-                    references[variable] = VaultReference(variable, match.group(1), match.group(2))
+            match = SECRET_RE.search(scalar)
+            if match:
+                references[variable] = VaultReference(variable, match.group(1), match.group(2))
     return references
 
 
@@ -92,17 +88,25 @@ def _find_compose_environment(path: Path, service_name: str) -> dict[str, str]:
         environment = service.get("environment", {})
         if isinstance(environment, dict):
             for name, value in environment.items():
-                if isinstance(name, str) and isinstance(value, str):
+                if not isinstance(name, str):
+                    continue
+                if value is None:
+                    result[name] = name
+                elif isinstance(value, str):
                     match = COMPOSE_RE.fullmatch(value.strip())
                     if match:
                         result[name] = match.group(1)
         elif isinstance(environment, list):
             for item in environment:
-                if isinstance(item, str) and "=" in item:
-                    name, value = item.split("=", 1)
-                    match = COMPOSE_RE.fullmatch(value.strip())
-                    if match:
-                        result[name] = match.group(1)
+                if not isinstance(item, str):
+                    continue
+                if "=" not in item:
+                    result[item] = item
+                    continue
+                name, value = item.split("=", 1)
+                match = COMPOSE_RE.fullmatch(value.strip())
+                if match:
+                    result[name] = match.group(1)
     return result
 
 
@@ -151,15 +155,26 @@ def _collect_secret_refs(value: Any, found: list[tuple[str, str]]) -> None:
             _collect_secret_refs(child, found)
 
 
+def _project_file(project_dir: Path, relative: Any, label: str) -> Path:
+    if not isinstance(relative, str) or not relative:
+        raise ValueError(f"configtrace.yml must define a file path for {label}")
+    root = project_dir.resolve()
+    path = (root / relative).resolve()
+    if path != root and root not in path.parents:
+        raise ValueError(f"file path for {label} must stay inside the project folder")
+    return path
+
+
 def run_checks(project_dir: Path) -> list[Finding]:
+    project_dir = project_dir.resolve()
     project_file = project_dir / "configtrace.yml"
     project = _load_yaml(project_file)[0]
     if not isinstance(project, dict):
         raise ValueError("configtrace.yml must contain a YAML mapping")
 
-    ansible_file = project_dir / project.get("ansible", "")
-    template_file = project_dir / project.get("template", "")
-    compose_file = project_dir / project.get("compose", "")
+    ansible_file = _project_file(project_dir, project.get("ansible"), "ansible")
+    template_file = _project_file(project_dir, project.get("template"), "template")
+    compose_file = _project_file(project_dir, project.get("compose"), "compose")
     service_name = project.get("service")
     findings: list[Finding] = []
 
@@ -187,10 +202,12 @@ def run_checks(project_dir: Path) -> list[Finding]:
             findings.append(Finding("TEMPLATE_MAPPING_MISSING", f"Vault variable {variable} from {reference.path}:{reference.key} is not mapped by the template.", str(template_file.relative_to(project_dir))))
 
     kubernetes_files = project.get("kubernetes", [])
+    if not isinstance(kubernetes_files, list):
+        raise ValueError("configtrace.yml must list Kubernetes files under kubernetes")
     declared_secrets: dict[str, set[str]] = {}
     existing_kubernetes_files: list[tuple[str, Path]] = []
     for relative in kubernetes_files:
-        path = project_dir / relative
+        path = _project_file(project_dir, relative, "kubernetes")
         if not path.is_file():
             findings.append(Finding("FILE_MISSING", f"Kubernetes file was not found: {relative}", str(relative)))
             continue
